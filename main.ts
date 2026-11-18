@@ -50,6 +50,32 @@ function isRiskAcceptable(currentClose: bigint, peak: bigint, maxDrawdownAllowed
   return currentDrawdownBps <= maxDrawdownAllowedBps;
 }
 
+// Position exit evaluation helper
+interface ExitDecision {
+  shouldExit: boolean;
+  reason: 'take_profit' | 'stop_loss' | 'time_stop' | null;
+}
+
+function evaluateExit(
+  currentClose: bigint,
+  entryPrice: bigint,
+  holdDuration: number
+): ExitDecision {
+  const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
+  const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
+
+  if (currentClose >= tpTarget) {
+    return { shouldExit: true, reason: 'take_profit' };
+  }
+  if (currentClose <= slTarget) {
+    return { shouldExit: true, reason: 'stop_loss' };
+  }
+  if (holdDuration >= MAX_HOLD_BARS) {
+    return { shouldExit: true, reason: 'time_stop' };
+  }
+  return { shouldExit: false, reason: null };
+}
+
 await runBars({
   onHello(state) {
     highHistory.length = 0;
@@ -98,14 +124,9 @@ await runBars({
       const holdDuration = batch.seq - (entryBar ?? batch.seq);
       const unrealizedBps = ((currentClose - entryPrice) * BPS) / entryPrice;
 
-      const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
-      const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
+      const decision = evaluateExit(currentClose, entryPrice, holdDuration);
 
-      const hitTp = currentClose >= tpTarget;
-      const hitSl = currentClose <= slTarget;
-      const hitTimeStop = holdDuration >= MAX_HOLD_BARS;
-
-      if (hitTp || hitSl || hitTimeStop) {
+      if (decision.shouldExit) {
         entryPrice = null;
         entryBar = null;
         posHighWatermark = 0n;
