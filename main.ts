@@ -120,9 +120,16 @@ await runBars({
     }
     const isReclaim = currentClose > priorHigh;
 
+    // Order sizing & validation helper
+    function getOrderNotional(availCash: bigint, minNotional: bigint): bigint {
+      const targetSpend = (availCash * 99n) / 100n;
+      return targetSpend >= minNotional ? targetSpend : 0n;
+    }
+
     if (isDip && isReclaim) {
-      const spend = (state.cash * 99n) / 100n;
-      if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
+      const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
+      const spend = getOrderNotional(state.cash, minNotional);
+      if (spend > 0n) {
         return [
           {
             side: 'buy',
