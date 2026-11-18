@@ -1,93 +1,60 @@
 import { BPS, runBars, type BarsState } from './vendor/makefun-bars.ts';
 
-const SYMBOL = 'CBBTC';
-const LOOKBACK_BARS = 180;
-const DIP_BPS = 120n;
-const RECLAIM_BARS = 3;
-const TP_BPS = 100n, SL_BPS = 80n;
-const MAX_HOLD_BARS = 360, MAX_SLIPPAGE_BPS = 500;
-
-const highHistory: bigint[] = [], closeHistory: bigint[] = [];
+const SYMBOL = 'CBBTC', LOOKBACK_BARS = 180, DIP_BPS = 120n, RECLAIM_BARS = 3;
+const TP_BPS = 100n, SL_BPS = 80n, MAX_HOLD_BARS = 360, MAX_SLIPPAGE_BPS = 500;
+const hBuf: bigint[] = [], cBuf: bigint[] = [];
 let entryPrice: bigint | null = null, entryBar: number | null = null;
 
-function getRollingPeak(highs: readonly bigint[], lookback: number): bigint {
-  if (highs.length === 0) return 0n;
-  const start = Math.max(0, highs.length - lookback);
-  let peak = highs[start];
-  for (let i = start + 1; i < highs.length; i++) if (highs[i] > peak) peak = highs[i];
-  return peak;
+function rollingPeak(arr: readonly bigint[], n: number): bigint {
+  let p = arr[Math.max(0, arr.length - n)] ?? 0n;
+  for (let i = Math.max(0, arr.length - n) + 1; i < arr.length; i++) if (arr[i] > p) p = arr[i];
+  return p;
 }
-
-function getPriorHigh(highs: readonly bigint[], lookback: number): bigint {
-  if (highs.length <= 1) return 0n;
-  const start = Math.max(0, highs.length - 1 - lookback);
-  let prior = highs[start];
-  for (let i = start + 1; i < highs.length - 1; i++) if (highs[i] > prior) prior = highs[i];
-  return prior;
-}
-
-function getOrderNotional(availCash: bigint, minNotional: bigint): bigint {
-  const targetSpend = (availCash * 99n) / 100n;
-  return targetSpend >= minNotional ? targetSpend : 0n;
+function priorHigh(arr: readonly bigint[], n: number): bigint {
+  let p = arr[Math.max(0, arr.length - 1 - n)] ?? 0n;
+  for (let i = Math.max(0, arr.length - 1 - n) + 1; i < arr.length - 1; i++) if (arr[i] > p) p = arr[i];
+  return p;
 }
 
 await runBars({
-  onHello() {
-    highHistory.length = 0;
-    closeHistory.length = 0;
-    entryPrice = null;
-    entryBar = null;
-  },
+  onHello() { hBuf.length = 0; cBuf.length = 0; entryPrice = null; entryBar = null; },
 
   onBatch(state: BarsState, batch) {
     const bar = state.latest.get(SYMBOL);
     if (!bar) return [];
+    const curClose = BigInt(bar.c);
+    hBuf.push(BigInt(bar.h));
+    cBuf.push(curClose);
 
-    highHistory.push(BigInt(bar.h));
-    closeHistory.push(BigInt(bar.c));
-    const currentClose = BigInt(bar.c);
-
-    for (const fill of batch.fills) {
-      if (fill.symbol === SYMBOL && fill.side === 'buy' && fill.status === 'filled') {
-        entryPrice = BigInt(fill.price);
-        entryBar = batch.seq;
+    for (const f of batch.fills) {
+      if (f.symbol === SYMBOL && f.side === 'buy' && f.status === 'filled') {
+        entryPrice = BigInt(f.price); entryBar = batch.seq;
       }
     }
 
     const pos = state.positions.get(SYMBOL);
     if (pos && pos.qty > 0n) {
-      if (entryPrice === null) {
-        entryPrice = currentClose;
-        entryBar = batch.seq;
-      }
-      const holdDuration = batch.seq - (entryBar ?? batch.seq);
-      const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
-      const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
-
-      if (currentClose >= tpTarget || currentClose <= slTarget || holdDuration >= MAX_HOLD_BARS) {
-        entryPrice = null;
-        entryBar = null;
+      if (entryPrice === null) { entryPrice = curClose; entryBar = batch.seq; }
+      const hold = batch.seq - (entryBar ?? batch.seq);
+      const tp = (entryPrice * (BPS + TP_BPS)) / BPS, sl = (entryPrice * (BPS - SL_BPS)) / BPS;
+      if (curClose >= tp || curClose <= sl || hold >= MAX_HOLD_BARS) {
+        entryPrice = null; entryBar = null;
         return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    entryPrice = null;
-    entryBar = null;
-    if (highHistory.length < RECLAIM_BARS) return [];
+    entryPrice = null; entryBar = null;
+    if (hBuf.length < RECLAIM_BARS) return [];
 
-    const peak = getRollingPeak(highHistory, LOOKBACK_BARS);
-    const isDip = currentClose <= (peak * (BPS - DIP_BPS)) / BPS;
-    const isReclaim = currentClose > getPriorHigh(highHistory, RECLAIM_BARS);
-
+    const isDip = curClose <= (rollingPeak(hBuf, LOOKBACK_BARS) * (BPS - DIP_BPS)) / BPS;
+    const isReclaim = curClose > priorHigh(hBuf, RECLAIM_BARS);
     if (isDip && isReclaim) {
-      const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
-      const spend = getOrderNotional(state.cash, minNotional);
-      if (spend > 0n) {
+      const spend = (state.cash * 99n) / 100n;
+      if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
         return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
     }
-
     return [];
   },
 });
