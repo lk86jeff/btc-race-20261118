@@ -76,6 +76,28 @@ function evaluateExit(
   return { shouldExit: false, reason: null };
 }
 
+// Rolling peak calculator
+function getRollingPeak(highs: readonly bigint[], lookback: number): bigint {
+  if (highs.length === 0) return 0n;
+  const start = Math.max(0, highs.length - lookback);
+  let peak = highs[start];
+  for (let i = start + 1; i < highs.length; i++) {
+    if (highs[i] > peak) peak = highs[i];
+  }
+  return peak;
+}
+
+// Prior high reclaim reference calculator
+function getPriorHigh(highs: readonly bigint[], lookback: number): bigint {
+  if (highs.length <= 1) return 0n;
+  const start = Math.max(0, highs.length - 1 - lookback);
+  let prior = highs[start];
+  for (let i = start + 1; i < highs.length - 1; i++) {
+    if (highs[i] > prior) prior = highs[i];
+  }
+  return prior;
+}
+
 await runBars({
   onHello(state) {
     highHistory.length = 0;
@@ -150,20 +172,11 @@ await runBars({
 
     if (highHistory.length < RECLAIM_BARS) return [];
 
-    const peakStart = Math.max(0, highHistory.length - LOOKBACK_BARS);
-    let peak = 0n;
-    for (let i = peakStart; i < highHistory.length; i++) {
-      if (highHistory[i] > peak) peak = highHistory[i];
-    }
-
+    const peak = getRollingPeak(highHistory, LOOKBACK_BARS);
     const dipThreshold = (peak * (BPS - DIP_BPS)) / BPS;
     const isDip = currentClose <= dipThreshold;
 
-    const recStart = Math.max(0, highHistory.length - 1 - RECLAIM_BARS);
-    let priorHigh = 0n;
-    for (let i = recStart; i < highHistory.length - 1; i++) {
-      if (highHistory[i] > priorHigh) priorHigh = highHistory[i];
-    }
+    const priorHigh = getPriorHigh(highHistory, RECLAIM_BARS);
     const isReclaim = currentClose > priorHigh;
     const isRiskOk = isRiskAcceptable(currentClose, peak, 2500n);
 
