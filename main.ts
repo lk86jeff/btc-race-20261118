@@ -21,6 +21,7 @@ const MAX_SLIPPAGE_BPS = 500; // 500 bps (5.00%) maximum slippage tolerance guar
 
 // Bar price history
 const highHistory: bigint[] = [];
+const lowHistory: bigint[] = [];
 const closeHistory: bigint[] = [];
 
 // Position tracking
@@ -28,9 +29,31 @@ let entryPrice: bigint | null = null;
 let entryBar: number | null = null;
 let posHighWatermark: bigint = 0n;
 
+// Volatility and risk metrics helper
+function computeRecentSpreadBps(highs: readonly bigint[], lows: readonly bigint[], lookback: number): bigint {
+  if (highs.length < lookback || lows.length < lookback) return 0n;
+  const start = highs.length - lookback;
+  let maxH = highs[start];
+  let minL = lows[start];
+  for (let i = start + 1; i < highs.length; i++) {
+    if (highs[i] > maxH) maxH = highs[i];
+    if (lows[i] < minL) minL = lows[i];
+  }
+  if (minL === 0n) return 0n;
+  return ((maxH - minL) * BPS) / minL;
+}
+
+// Position risk validation helper
+function isRiskAcceptable(currentClose: bigint, peak: bigint, maxDrawdownAllowedBps: bigint): boolean {
+  if (peak === 0n) return false;
+  const currentDrawdownBps = ((peak - currentClose) * BPS) / peak;
+  return currentDrawdownBps <= maxDrawdownAllowedBps;
+}
+
 await runBars({
   onHello(state) {
     highHistory.length = 0;
+    lowHistory.length = 0;
     closeHistory.length = 0;
     entryPrice = null;
     entryBar = null;
@@ -42,9 +65,11 @@ await runBars({
     if (!bar) return [];
 
     const currentHigh = BigInt(bar.h);
+    const currentLow = BigInt(bar.l);
     const currentClose = BigInt(bar.c);
 
     highHistory.push(currentHigh);
+    lowHistory.push(currentLow);
     closeHistory.push(currentClose);
 
     // Track fills to update exact entry price and trailing high watermark
@@ -119,6 +144,7 @@ await runBars({
       if (highHistory[i] > priorHigh) priorHigh = highHistory[i];
     }
     const isReclaim = currentClose > priorHigh;
+    const isRiskOk = isRiskAcceptable(currentClose, peak, 2500n);
 
     // Order sizing & validation helper
     function getOrderNotional(availCash: bigint, minNotional: bigint): bigint {
@@ -126,7 +152,7 @@ await runBars({
       return targetSpend >= minNotional ? targetSpend : 0n;
     }
 
-    if (isDip && isReclaim) {
+    if (isDip && isReclaim && isRiskOk) {
       const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
       const spend = getOrderNotional(state.cash, minNotional);
       if (spend > 0n) {
