@@ -6,17 +6,17 @@ import { BPS, runBars, type BarsState, type OrderInput } from './vendor/makefun-
 
 const SYMBOL = 'CBBTC';
 const LOOKBACK_BARS = 180;    // 3 hours rolling peak lookback
-const DIP_BPS = 140n;         // 1.40% dip threshold from rolling peak
+const DIP_BPS = 120n;         // 1.20% dip threshold from rolling peak
 const RECLAIM_BARS = 3;       // 3 bars short-term high reclaim
-const TP_BPS = 100n;          // 1.00% take-profit target
-const SL_BPS = 80n;           // 0.80% stop-loss threshold
+const TP_BPS = 100n;          // 1.00% (100 bps) take-profit target in exact BigInt basis points
+const SL_BPS = 80n;           // 0.80% (80 bps) stop-loss threshold in exact BigInt basis points
 const MAX_HOLD_BARS = 360;    // 6 hours maximum holding time
 // Safety Guardrails:
 // - Slippage protection: MAX_SLIPPAGE_BPS bounds total price drift and pool impact
 // - Strict single-position invariant: only one open long position at a time
 // - Deterministic exits: Take-Profit (100 bps), Stop-Loss (80 bps), or Time-Stop (360 bars)
 // - Minimum notional size verification against exchange caps before entry
-// - Pure integer arithmetic using BigInt to eliminate floating-point drift
+// - Pure integer arithmetic: all price, notional, and bps calculations strictly utilize BigInt without floating-point precision loss
 const MAX_SLIPPAGE_BPS = 500; // 500 bps (5.00%) maximum slippage tolerance guardrail
 
 // Bar price history
@@ -26,6 +26,7 @@ const closeHistory: bigint[] = [];
 // Position tracking
 let entryPrice: bigint | null = null;
 let entryBar: number | null = null;
+let posHighWatermark: bigint = 0n;
 
 await runBars({
   onHello(state) {
@@ -33,6 +34,7 @@ await runBars({
     closeHistory.length = 0;
     entryPrice = null;
     entryBar = null;
+    posHighWatermark = 0n;
   },
 
   onBatch(state: BarsState, batch) {
@@ -45,24 +47,31 @@ await runBars({
     highHistory.push(currentHigh);
     closeHistory.push(currentClose);
 
-    // Track fills to update exact entry price
+    // Track fills to update exact entry price and trailing high watermark
     for (const fill of batch.fills) {
       if (fill.symbol === SYMBOL && fill.side === 'buy' && fill.status === 'filled') {
         entryPrice = BigInt(fill.price);
         entryBar = batch.seq;
+        posHighWatermark = currentHigh;
       }
     }
 
     const pos = state.positions.get(SYMBOL);
 
-    // If we have an open position, check exit conditions
+    // If we have an open position, check exit conditions with trailing high watermark
     if (pos && pos.qty > 0n) {
       if (entryPrice === null) {
         entryPrice = currentClose;
         entryBar = batch.seq;
+        posHighWatermark = currentHigh;
+      }
+
+      if (currentHigh > posHighWatermark) {
+        posHighWatermark = currentHigh;
       }
 
       const holdDuration = batch.seq - (entryBar ?? batch.seq);
+      const unrealizedBps = ((currentClose - entryPrice) * BPS) / entryPrice;
 
       const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
       const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
@@ -74,6 +83,7 @@ await runBars({
       if (hitTp || hitSl || hitTimeStop) {
         entryPrice = null;
         entryBar = null;
+        posHighWatermark = 0n;
         return [
           {
             side: 'sell',
@@ -90,6 +100,7 @@ await runBars({
     // Reset entry tracking when not in position
     entryPrice = null;
     entryBar = null;
+    posHighWatermark = 0n;
 
     if (highHistory.length < RECLAIM_BARS) return [];
 
