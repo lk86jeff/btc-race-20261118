@@ -1,203 +1,90 @@
-// Autonomous Pullback Recovery & Reclaim Trading Strategy
-// Designed for make.fun CBBTC/USDC 24-hour race.
-// Long-only, low-turnover, regime-adaptive execution.
-
-import { BPS, runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
+import { BPS, runBars, type BarsState } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const LOOKBACK_BARS = 180;    // 3 hours rolling peak lookback
-const DIP_BPS = 120n;         // 1.20% dip threshold from rolling peak
-const RECLAIM_BARS = 3;       // 3 bars short-term high reclaim
-const TP_BPS = 100n;          // 1.00% (100 bps) take-profit target in exact BigInt basis points
-const SL_BPS = 80n;           // 0.80% (80 bps) stop-loss threshold in exact BigInt basis points
-const MAX_HOLD_BARS = 360;    // 6 hours maximum holding time
-// Safety Guardrails:
-// - Slippage protection: MAX_SLIPPAGE_BPS bounds total price drift and pool impact
-// - Strict single-position invariant: only one open long position at a time
-// - Deterministic exits: Take-Profit (100 bps), Stop-Loss (80 bps), or Time-Stop (360 bars)
-// - Minimum notional size verification against exchange caps before entry
-// - Pure integer arithmetic: all price, notional, and bps calculations strictly utilize BigInt without floating-point precision loss
-const MAX_SLIPPAGE_BPS = 500; // 500 bps (5.00%) maximum slippage tolerance guardrail
+const LOOKBACK_BARS = 180;
+const DIP_BPS = 120n;
+const RECLAIM_BARS = 3;
+const TP_BPS = 100n, SL_BPS = 80n;
+const MAX_HOLD_BARS = 360, MAX_SLIPPAGE_BPS = 500;
 
-// Bar price history
-const highHistory: bigint[] = [];
-const lowHistory: bigint[] = [];
-const closeHistory: bigint[] = [];
+const highHistory: bigint[] = [], closeHistory: bigint[] = [];
+let entryPrice: bigint | null = null, entryBar: number | null = null;
 
-// Position tracking
-let entryPrice: bigint | null = null;
-let entryBar: number | null = null;
-let posHighWatermark: bigint = 0n;
-
-// Volatility and risk metrics helper
-function computeRecentSpreadBps(highs: readonly bigint[], lows: readonly bigint[], lookback: number): bigint {
-  if (highs.length < lookback || lows.length < lookback) return 0n;
-  const start = highs.length - lookback;
-  let maxH = highs[start];
-  let minL = lows[start];
-  for (let i = start + 1; i < highs.length; i++) {
-    if (highs[i] > maxH) maxH = highs[i];
-    if (lows[i] < minL) minL = lows[i];
-  }
-  if (minL === 0n) return 0n;
-  return ((maxH - minL) * BPS) / minL;
-}
-
-// Position risk validation helper
-function isRiskAcceptable(currentClose: bigint, peak: bigint, maxDrawdownAllowedBps: bigint): boolean {
-  if (peak === 0n) return false;
-  const currentDrawdownBps = ((peak - currentClose) * BPS) / peak;
-  return currentDrawdownBps <= maxDrawdownAllowedBps;
-}
-
-// Position exit evaluation helper
-interface ExitDecision {
-  shouldExit: boolean;
-  reason: 'take_profit' | 'stop_loss' | 'time_stop' | null;
-}
-
-function evaluateExit(
-  currentClose: bigint,
-  entryPrice: bigint,
-  holdDuration: number
-): ExitDecision {
-  const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
-  const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
-
-  if (currentClose >= tpTarget) {
-    return { shouldExit: true, reason: 'take_profit' };
-  }
-  if (currentClose <= slTarget) {
-    return { shouldExit: true, reason: 'stop_loss' };
-  }
-  if (holdDuration >= MAX_HOLD_BARS) {
-    return { shouldExit: true, reason: 'time_stop' };
-  }
-  return { shouldExit: false, reason: null };
-}
-
-// Rolling peak calculator
 function getRollingPeak(highs: readonly bigint[], lookback: number): bigint {
   if (highs.length === 0) return 0n;
   const start = Math.max(0, highs.length - lookback);
   let peak = highs[start];
-  for (let i = start + 1; i < highs.length; i++) {
-    if (highs[i] > peak) peak = highs[i];
-  }
+  for (let i = start + 1; i < highs.length; i++) if (highs[i] > peak) peak = highs[i];
   return peak;
 }
 
-// Prior high reclaim reference calculator
 function getPriorHigh(highs: readonly bigint[], lookback: number): bigint {
   if (highs.length <= 1) return 0n;
   const start = Math.max(0, highs.length - 1 - lookback);
   let prior = highs[start];
-  for (let i = start + 1; i < highs.length - 1; i++) {
-    if (highs[i] > prior) prior = highs[i];
-  }
+  for (let i = start + 1; i < highs.length - 1; i++) if (highs[i] > prior) prior = highs[i];
   return prior;
 }
 
+function getOrderNotional(availCash: bigint, minNotional: bigint): bigint {
+  const targetSpend = (availCash * 99n) / 100n;
+  return targetSpend >= minNotional ? targetSpend : 0n;
+}
+
 await runBars({
-  onHello(state) {
+  onHello() {
     highHistory.length = 0;
-    lowHistory.length = 0;
     closeHistory.length = 0;
     entryPrice = null;
     entryBar = null;
-    posHighWatermark = 0n;
   },
 
   onBatch(state: BarsState, batch) {
     const bar = state.latest.get(SYMBOL);
     if (!bar) return [];
 
-    const currentHigh = BigInt(bar.h);
-    const currentLow = BigInt(bar.l);
+    highHistory.push(BigInt(bar.h));
+    closeHistory.push(BigInt(bar.c));
     const currentClose = BigInt(bar.c);
 
-    highHistory.push(currentHigh);
-    lowHistory.push(currentLow);
-    closeHistory.push(currentClose);
-
-    // Track fills to update exact entry price and trailing high watermark
     for (const fill of batch.fills) {
       if (fill.symbol === SYMBOL && fill.side === 'buy' && fill.status === 'filled') {
         entryPrice = BigInt(fill.price);
         entryBar = batch.seq;
-        posHighWatermark = currentHigh;
       }
     }
 
     const pos = state.positions.get(SYMBOL);
-
-    // If we have an open position, check exit conditions with trailing high watermark
     if (pos && pos.qty > 0n) {
       if (entryPrice === null) {
         entryPrice = currentClose;
         entryBar = batch.seq;
-        posHighWatermark = currentHigh;
       }
-
-      if (currentHigh > posHighWatermark) {
-        posHighWatermark = currentHigh;
-      }
-
       const holdDuration = batch.seq - (entryBar ?? batch.seq);
-      const unrealizedBps = ((currentClose - entryPrice) * BPS) / entryPrice;
+      const tpTarget = (entryPrice * (BPS + TP_BPS)) / BPS;
+      const slTarget = (entryPrice * (BPS - SL_BPS)) / BPS;
 
-      const decision = evaluateExit(currentClose, entryPrice, holdDuration);
-
-      if (decision.shouldExit) {
+      if (currentClose >= tpTarget || currentClose <= slTarget || holdDuration >= MAX_HOLD_BARS) {
         entryPrice = null;
         entryBar = null;
-        posHighWatermark = 0n;
-        return [
-          {
-            side: 'sell',
-            symbol: SYMBOL,
-            qty: pos.qty,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          },
-        ];
+        return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
-
       return [];
     }
 
-    // Reset entry tracking when not in position
     entryPrice = null;
     entryBar = null;
-    posHighWatermark = 0n;
-
     if (highHistory.length < RECLAIM_BARS) return [];
 
     const peak = getRollingPeak(highHistory, LOOKBACK_BARS);
-    const dipThreshold = (peak * (BPS - DIP_BPS)) / BPS;
-    const isDip = currentClose <= dipThreshold;
+    const isDip = currentClose <= (peak * (BPS - DIP_BPS)) / BPS;
+    const isReclaim = currentClose > getPriorHigh(highHistory, RECLAIM_BARS);
 
-    const priorHigh = getPriorHigh(highHistory, RECLAIM_BARS);
-    const isReclaim = currentClose > priorHigh;
-    const isRiskOk = isRiskAcceptable(currentClose, peak, 2500n);
-
-    // Order sizing & validation helper
-    function getOrderNotional(availCash: bigint, minNotional: bigint): bigint {
-      const targetSpend = (availCash * 99n) / 100n;
-      return targetSpend >= minNotional ? targetSpend : 0n;
-    }
-
-    if (isDip && isReclaim && isRiskOk) {
+    if (isDip && isReclaim) {
       const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
       const spend = getOrderNotional(state.cash, minNotional);
       if (spend > 0n) {
-        return [
-          {
-            side: 'buy',
-            symbol: SYMBOL,
-            notional_quote_units: spend,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          },
-        ];
+        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
     }
 
